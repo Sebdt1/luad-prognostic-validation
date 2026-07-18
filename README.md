@@ -1,33 +1,35 @@
 # luad-prognostic-validation
 
-¿Un score transcriptómico de proliferación aporta información pronóstica más allá
-del estadio, la edad y el sexo en adenocarcinoma de pulmón? ¿Y replica en una
-cohorte independiente?
+**Un score transcriptómico de proliferación predice supervivencia en adenocarcinoma
+de pulmón y replica en una cohorte independiente, pero aporta poco sobre el estadio,
+y el modelo complejo rinde peor que el simple.**
 
-Aquí está el estudio entero: pipeline reproducible en R/Bioconductor sobre
-TCGA-LUAD y GSE68465, con validación interna y externa. El reporte no infla los
-resultados, que es buena parte de la gracia.
+Cuatro resultados medidos sobre TCGA-LUAD (n=504, 182 muertes) y GSE68465 (n=442,
+236 muertes):
 
-## Qué salió
+| Hallazgo | Evidencia |
+|---|---|
+| La asociación es real y replica | HR 1.35 (IC95% 1.11–1.63) en TCGA; HR 1.24 (1.08–1.42) al re-ajustar en GEO |
+| El aporte incremental no es demostrable | C-index corregido 0.66 → 0.69, pero ΔAUC y ΔBrier en el test retenido **no** son significativos (IC cruzan cero) |
+| Lo data-driven sobreajusta | Elastic-net de 26 genes: C 0.77 en training → **0.56** en test, con IC que incluye 0.5 |
+| El transporte exige recalibración | Congelado, el score degrada el Brier en GEO (p<0.05); re-estandarizarlo en la cohorte destino lo corrige |
 
-El score sí se asocia de forma independiente a la supervivencia tras ajustar por
-estadio, edad y sexo (HR 1.35, IC95% 1.11–1.63, p=0.003), y la asociación replica
-en GEO (HR 1.24, IC95% 1.08–1.42, p=0.002). Hasta ahí, bien.
+El valor de este trabajo está en la validación, no en la firma. Un aporte pequeño
+pero replicable es un resultado; uno grande que no replica es una alarma.
 
-Lo que no se sostiene es la mejora de discriminación. El C-index corregido por
-optimismo sube de 0.66 a 0.69, pero los contrastes formales de ΔAUC y ΔBrier en el
-test retenido no son significativos: los intervalos cruzan cero. Un elastic-net de
-26 genes, que en training parecía muy superior (C=0.77), se hunde a 0.56 en el test
-retenido, con un intervalo que incluye 0.5. Sobreajuste de manual. Y al transportar
-el modelo congelado a GEO el score empeora la calibración de forma significativa,
-aunque re-estandarizarlo en la cohorte destino lo corrige del todo.
+Lectura rápida: [reporte completo con 9 figuras](reports/report.html) ·
+[paquete de revisión externa](results/review_packet.md) (GitHub lo renderiza directo).
 
-Señal real y replicable, aporte pequeño, y la complejidad no ayuda. El valor del
-trabajo está en la validación, no en la firma.
+## Contexto
 
-Los resultados completos, con tablas y 9 figuras, están en
-[`results/review_packet.md`](results/review_packet.md), que GitHub renderiza
-directamente.
+La pregunta de partida era si el score aporta información pronóstica más allá del
+estadio, la edad y el sexo, y si esa señal sobrevive al cambio de cohorte y de
+plataforma. El diseño se hizo para poder responder que no: partición train/test antes
+de tocar nada, selección solo en training, contrastes formales entre modelos anidados
+y validación externa por dos vías (transporte del modelo congelado y re-ajuste dentro
+de GEO).
+
+Los datos crudos no se redistribuyen. El pipeline los descarga del GDC y de GEO.
 
 ## Estado
 
