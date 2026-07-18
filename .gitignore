@@ -1,0 +1,52 @@
+# --- Datos crudos (grandes y/o con términos de uso; NO versionar) ------------
+data/raw/
+
+# --- Residuos de descargas del GDC -------------------------------------------
+# TCGAbiolinks extrae el tarball en el *working directory* y, si la descarga
+# falla, deja cientos de carpetas <UUID>/ con .tsv en la raíz del proyecto.
+????????-????-????-????-????????????/
+*.tar.gz
+MANIFEST.txt
+gdc_client_configuration.dtt
+# Conservar la carpeta processed pero no sus contenidos pesados
+data/processed/*
+!data/processed/.gitkeep
+
+# --- Artefactos del pipeline targets -----------------------------------------
+_targets/
+!_targets.R
+
+# --- renv: versionar el lockfile y activate.R, NO la librería ----------------
+renv/library/
+renv/local/
+renv/cellar/
+renv/lock/
+renv/python/
+renv/sandbox/
+renv/staging/
+
+# --- R / RStudio -------------------------------------------------------------
+.Rproj.user/
+.Rhistory
+.RData
+.Ruserdata
+*.Rproj
+
+# --- Quarto ------------------------------------------------------------------
+/.quarto/
+reports/*.html
+reports/*_files/
+reports/*_cache/
+# Excepción: se versiona el reporte renderizado (autocontenido, con las figuras
+# embebidas) para poder leerlo sin instalar R ni regenerar el pipeline.
+!reports/report.html
+
+# --- Resultados voluminosos (regenerables por el pipeline) -------------------
+# Se conservan las figuras/tablas ligeras para el reporte; descomentar si pesan.
+# results/figures/*
+# results/tables/*
+
+# --- Sistema operativo -------------------------------------------------------
+.DS_Store
+Thumbs.db
+desktop.ini

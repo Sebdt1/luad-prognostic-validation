@@ -1,0 +1,9 @@
+variable,valor
+N muestras,504
+"Eventos (n, %)",182 (36.1%)
+Edad (mediana [IQR]),66 [59-73]
+"Mujeres (n, %)",272 (54.0%)
+Estadio I/II/III/IV,270 / 120 / 81 / 25
+Estadio faltante (n),8
+"Seguimiento mediano (dias, KM inverso)",882
+Endpoint,OS

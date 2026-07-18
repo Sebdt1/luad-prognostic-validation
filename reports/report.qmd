@@ -1,0 +1,532 @@
+---
+title: "Validación pronóstica de un score transcriptómico de proliferación en adenocarcinoma de pulmón (TCGA-LUAD) con replicación externa GEO"
+author: "Juan Sebastián Díaz Tobar"
+date: today
+lang: es
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: true
+    embed-resources: true
+    theme: cosmo
+execute:
+  echo: false
+  warning: false
+  message: false
+knitr:
+  opts_chunk:
+    fig.align: center
+---
+
+```{r setup}
+library(targets); library(knitr); library(ggplot2)
+# El reporte se renderiza en una sesión R APARTE, que no ejecuta tar_source("R").
+# Como los chunks generan figuras llamando funciones del proyecto, hay que cargar
+# el código y los paquetes aquí explícitamente.
+suppressMessages({
+  library(survival); library(survminer); library(riskRegression)
+  library(matrixStats); library(tidyr)
+})
+ROOT <- if (dir.exists("R")) "." else ".."
+for (f in list.files(file.path(ROOT, "R"), pattern = "\\.R$", full.names = TRUE)) source(f)
+# Todos los objetos provienen del pipeline targets (reproducible y cacheado).
+# Este reporte NO recomputa nada: solo lee resultados con tar_read().
+kb <- function(x, ...) knitr::kable(x, digits = 3, ...)
+# Quarto renderiza con el cwd en reports/, así que el store de targets está en
+# el directorio padre. Se detecta en ambos casos y se pasa explícitamente.
+STORE <- if (dir.exists("_targets")) "_targets" else file.path("..", "_targets")
+tr <- function(name) tryCatch(targets::tar_read_raw(name, store = STORE),
+                              error = function(e) NULL)
+# Inserta una o varias figuras con rutas RELATIVAS al .qmd: los targets de figura
+# guardan rutas ABSOLUTAS (here::here) y knitr::include_graphics falla con ellas.
+# Se pasan todas juntas en una sola llamada para que se rendericen todas.
+img <- function(...) {
+  ps <- unlist(lapply(c(...), function(n) {
+    p <- tr(n); if (is.null(p)) return(NULL)
+    rel <- file.path("..", "results", "figures", basename(p))
+    if (file.exists(rel)) rel else NULL
+  }))
+  if (length(ps)) knitr::include_graphics(ps) else invisible(NULL)
+}
+params <- tr("params")
+```
+
+```{r deps}
+# Declaracion explicita de dependencias del reporte: tarchetypes detecta estos
+# nombres literales en tar_load() y crea las aristas del DAG, de modo que el
+# reporte se construye DESPUES de todos sus insumos (no antes). Las lecturas
+# reales, tolerantes a NULL, se hacen con tr() en cada seccion.
+targets::tar_load(c(
+  params, cohort_tab, split_balance, sample_qc_tab, batch, fig_batch,
+  fig_km, fig_km_stage, fig_miss, cox_clin_tab, cox_full_tab, lrt, ph_tab,
+  c_opt_clin, c_opt_full, c_test, metrics_test, fig_calib, rmst_tab, mice_tab,
+  ext_disc, ext_assoc, ext_cal,
+  contr_int_auc, contr_int_brier, contr_ext_auc, contr_ext_brier,
+  elastic_perf, strat_tab, ext_cal_rescaled, rescale_decomp,
+  clinical, moddata, cox_full, test_dat
+), store = STORE)
+```
+
+# Resumen
+
+**Objetivo.** Evaluar si un score transcriptómico de proliferación (firmas Hallmark G2M y E2F,
+cuantificadas con singscore) aporta información pronóstica más allá del estadio, la edad y el
+sexo en adenocarcinoma de pulmón (LUAD), y si replica en una cohorte independiente.
+
+**Métodos.** TCGA-LUAD (n=504; 182 muertes) se particionó en training/test antes de todo
+análisis; toda selección se realizó solo en training. Se ajustaron modelos de Cox clínico
+(edad, sexo, estadio) frente a clínico + score, con verificación de supuestos, validación
+interna (C-index corregido por optimismo, AUC(t), Brier/IPA con contrastes formales entre
+modelos anidados) y validación externa en GSE68465 (n=442; 236 muertes), tanto por transporte
+del modelo congelado como por re-ajuste dentro de la cohorte.
+
+**Resultados.** El score se asoció de forma independiente a la supervivencia tras ajuste
+(HR 1.35; IC95% 1.11–1.63; razón de verosimilitud p=0.003) y la asociación replicó externamente
+(HR ajustado 1.24; IC95% 1.08–1.42; p=0.002). Sin embargo, su aporte incremental de
+discriminación no fue estadísticamente detectable: el C-index corregido subió de 0.66 a 0.69,
+pero los contrastes de ΔAUC y ΔBrier en el test retenido no fueron significativos (IC cruzan
+cero). Un modelo data-driven (elastic-net, 26 genes) sobreajustó gravemente (C aparente 0.77 →
+0.56 en test, IC incluye 0.5) y no superó al score simple. En transporte congelado el score
+empeoró la calibración (ΔBrier>0; p<0.05 en los tres horizontes); una descomposición algebraica
+mostró que se debe a una descalibración corregible (la media del score en escala TCGA se
+desplaza −3.18 DE en GEO, infra-estimando el riesgo ~61%), que se resuelve re-estandarizando el
+score en la cohorte destino.
+
+**Conclusiones.** El score de proliferación es una señal pronóstica real y replicable pero de
+aporte incremental pequeño sobre el estadio; la complejidad data-driven no mejora el desempeño
+y el uso entre plataformas exige recalibración. El valor del trabajo reside en la validación
+rigurosa, no en la novedad de la firma.
+
+# Objetivo
+
+**Pregunta.** ¿Un *score* transcriptómico de proliferación (firmas Hallmark G2M
+y E2F, cuantificadas con *singscore*) aporta información pronóstica **más allá**
+de las variables clínicas estándar (estadio, edad, sexo) en adenocarcinoma de
+pulmón, y **replica** en una cohorte GEO independiente?
+
+**Hipótesis.**
+
+- **H1**: el score se asocia de forma independiente a la supervivencia tras
+  ajuste y mejora el C-index frente al modelo clínico, replicando externamente.
+- **H0**: no aporta tras ajuste, o no replica.
+
+> Resultado *esperado y aceptable*: un aporte incremental **pequeño** y una
+> **atenuación** de la señal en validación externa. Este estudio está diseñado
+> para poder **rechazar** H1 con honestidad si los datos no la sostienen.
+
+# Métodos
+
+**Datos.** TCGA-LUAD RNA-seq (STAR counts) y clínica vía `TCGAbiolinks`
+(open-access). Endpoint pronóstico tomado del recurso curado **TCGA-CDR**
+(Liu et al., *Cell* 2018): supervivencia global (OS) o intervalo libre de
+progresión (PFI), **no** `days_to_death` crudo. Validación externa: cohorte GEO
+de LUAD con supervivencia (`r params$acquisition$geo$gse_id`) vía `GEOquery`.
+
+**Prevención de fuga de información.** La cohorte TCGA se **particiona en
+training/test antes de cualquier análisis** (estratificando por estadio). Toda
+selección —filtro de genes, escala del score, ajuste del elastic-net— se hace
+**solo en training**; el test permanece intacto para validación interna.
+
+**Preprocesamiento.** Filtro de genes de baja expresión aprendido en training;
+estabilización de varianza (VST de `DESeq2`, con la tendencia de dispersión
+ajustada en training) o logCPM; QC de muestras por tamaño de librería;
+inspección de efecto de lote (TSS/placa) por PCA (se documenta, no se
+sobre-corrige).
+
+**Score y features.** *(a)* Primario: proliferación con `singscore`
+(rank-based, transferible entre plataformas) sobre Hallmark G2M/E2F. *(b)*
+Secundario: Cox elastic-net (`glmnet`), λ por validación cruzada.
+
+**Modelado.** Cox de riesgos proporcionales comparando **modelo clínico**
+(edad, sexo, estadio) frente a **clínico + score**. Se verifican supuestos:
+proporcionalidad (Schoenfeld), forma funcional (residuos de martingala) e
+influencia (dfbeta). Si falla la proporcionalidad, se reporta y se evalúan
+alternativas (estratificado, RMST, RSF) como sensibilidad.
+
+**Validación interna.** C-index corregido por optimismo vía bootstrap; AUC
+tiempo-dependiente (`timeROC`); calibración y Brier/IPA (`riskRegression`), con
+intervalos de confianza.
+
+**Validación externa.** Transporte del modelo congelado a GEO (discriminación y
+calibración) y, por separado, re-ajuste dentro de GEO para comprobar si la
+asociación independiente replica.
+
+**Reproducibilidad.** Semilla global en `config/params.yml`, entorno `renv`,
+pipeline `targets`, tests `testthat`, y `sessionInfo()` al final.
+
+# Resultados
+
+## Descripción de la cohorte y partición
+
+```{r cohorte}
+cohort_tab <- tr("cohort_tab")
+if (!is.null(cohort_tab)) kb(cohort_tab, caption = "Resumen de cohorte TCGA-LUAD")
+split_balance <- tr("split_balance")
+if (!is.null(split_balance)) kb(split_balance,
+  caption = "Balance de estadio entre training y test")
+```
+
+## Control de calidad
+
+```{r qc}
+sq <- tr("sample_qc_tab")
+if (!is.null(sq)) kb(utils::head(sq[order(-abs(sq$mad_z)), ], 8),
+  caption = "Muestras con mayor desviación de tamaño de librería (top 8)")
+batch <- tr("batch")
+if (!is.null(batch)) kb(batch$assoc,
+  caption = "Asociación PC ~ variable de lote (R²): magnitud del efecto de lote")
+```
+
+```{r}
+#| label: fig-pca
+#| fig-width: 6.5
+#| fig-height: 4.8
+#| fig-cap: "PCA de la expresión estabilizada por varianza (VST), coloreada por centro de tejido (TSS). Las dos primeras componentes explican poca varianza (PC1 9.7%, PC2 7.4%) y las muestras se mezclan sin agruparse por lote, consistente con el R² bajo de cada PC frente a TSS/placa (máximo 0.159). El efecto de lote se documenta pero no se corrige, para no eliminar señal biológica confundida con el centro. La leyenda se omite: TSS tiene 33 niveles."
+print(plot_batch_pca(tr("batch"), "tss"))
+```
+
+## Exploración de supervivencia
+
+```{r}
+#| label: fig-km-global
+#| fig-width: 6.5
+#| fig-height: 4.6
+#| fig-cap: "Supervivencia global en TCGA-LUAD (Kaplan-Meier). OS de la cohorte completa (n=504, 182 eventos); banda sombreada = IC95%. La mediana de supervivencia es de 1499 días (IC95% 1268–1778), distinta de la mediana de SEGUIMIENTO (882 d por KM inverso, ver tabla de cohorte). Los eventos se vuelven escasos más allá de ~3500 días, donde la curva se estabiliza en torno al 21%."
+print(km_global(tr("clinical"), tr("params")))
+```
+
+```{r}
+#| label: fig-km-stage
+#| fig-width: 6.5
+#| fig-height: 4.6
+#| fig-cap: "Supervivencia global por estadio AJCC agrupado. El estadio discrimina fuertemente el pronóstico (log-rank p=1.2e-12): estadio I mejor, IV peor. Los estadios II y III se solapan parcialmente y la curva de IV (n=25) es inestable y termina temprano por el bajo número de sujetos. Esta señal dominante del estadio motiva ajustarlo en todos los modelos: sin ese ajuste, un marcador tiende a ser su proxy."
+print(km_by(tr("clinical"), "stage_group", tr("params")))
+```
+
+```{r}
+#| label: fig-km-score
+#| fig-width: 6.5
+#| fig-height: 4.6
+#| fig-cap: "Supervivencia global por grupo alto/bajo del score de proliferación (corte en la mediana; el modelado usa el score continuo). La separación es real pero modesta (log-rank p=0.005), muy inferior a la del estadio (@fig-km-stage). Dicotomizar por la mediana pierde información y se muestra solo con fines descriptivos."
+print(plot_km_score(tr("moddata"), tr("params")))
+```
+
+```{r}
+#| label: fig-missing
+#| fig-width: 6
+#| fig-height: 3.6
+#| fig-cap: "Datos faltantes por variable. Ausencia mínima: edad 1.98% y estadio 1.59% (8/504); el resto sin faltantes. Respalda el análisis primario por caso completo, cuyo HR del score es prácticamente idéntico al de imputación múltiple (1.346 vs 1.325)."
+print(plot_missingness(tr("miss_tab")))
+```
+
+## Modelo incremental (clínico vs clínico + score)
+
+```{r cox}
+cc <- tr("cox_clin_tab"); cf <- tr("cox_full_tab")
+if (!is.null(cc)) kb(cc, caption = "Modelo clínico (HR, IC95%)")
+if (!is.null(cf)) kb(cf, caption = "Modelo clínico + score de proliferación")
+lrt <- tr("lrt")
+if (!is.null(lrt)) kb(lrt, caption = "Test de razón de verosimilitud (aporte incremental del score)")
+```
+
+```{r}
+#| label: fig-forest
+#| fig-width: 6.5
+#| fig-height: 3.8
+#| fig-cap: "Hazard ratios del modelo clínico + score (IC95%, escala logarítmica; línea discontinua en HR=1). El estadio domina el pronóstico (HR ~2.5–3.2 para II–IV frente a I), mientras el score aporta un efecto pequeño pero claramente separado de 1 (HR 1.35 por DE). Edad y sexo no alcanzan significación tras el ajuste."
+print(plot_forest(tr("cox_full_tab")))
+```
+
+> **Lectura crítica.** El HR del score debe interpretarse **tras** el ajuste por
+> estadio. Un score que solo es significativo sin ajuste es, muy probablemente,
+> un proxy del estadio.
+
+### Supuestos del modelo
+
+```{r ph}
+ph <- tr("ph_tab")
+if (!is.null(ph)) kb(cbind(term = rownames(ph), ph),
+  caption = "Prueba de Schoenfeld (proporcionalidad de riesgos). p pequeño = posible violación")
+```
+
+## Validación interna
+
+```{r internal}
+co_clin <- tr("c_opt_clin"); co_full <- tr("c_opt_full")
+if (!is.null(co_clin) && !is.null(co_full)) {
+  kb(rbind(Clinico = co_clin, `Clinico+Score` = co_full),
+     caption = "C-index aparente y corregido por optimismo (bootstrap)")
+}
+ct <- tr("c_test")
+if (!is.null(ct)) kb(ct, caption = "C-index en el test interno retenido")
+mt <- tr("metrics_test")
+if (!is.null(mt)) {
+  if (!is.null(mt$AUC))   kb(as.data.frame(mt$AUC$score),   caption = "AUC tiempo-dependiente (test)")
+  if (!is.null(mt$Brier)) kb(as.data.frame(mt$Brier$score), caption = "Brier / IPA (test)")
+}
+```
+
+```{r}
+#| label: fig-auc-t
+#| fig-width: 6.5
+#| fig-height: 4.2
+#| fig-cap: "AUC tiempo-dependiente en el test interno retenido, con IC95%, a 1, 3 y 5 años. El modelo con score queda por encima del clínico en los tres horizontes, pero los intervalos se solapan ampliamente y los contrastes formales de ΔAUC no son significativos (ver tabla de contrastes)."
+print(plot_auc_time(tr("metrics_test")))
+```
+
+```{r}
+#| label: fig-calib
+#| fig-width: 6
+#| fig-height: 5.4
+#| fig-cap: "Calibración del modelo clínico+score en el test interno retenido, a 1825 días (5 años). La diagonal es la calibración perfecta; la curva queda por encima en todo el rango, es decir el modelo INFRA-ESTIMA el riesgo. Esto no indica un modelo roto sino dos cosas: (i) el brazo de test resultó con mayor tasa de eventos que el de training (42.5% vs 33.3%), de modo que el hazard basal de training predice riesgos demasiado bajos en test; y (ii) a 5 años, con n=146 y 61 eventos, quedan muy pocos sujetos en riesgo y la estimación local es inestable, que es el horizonte donde el IPA interno es negativo (−0.256). La señal fiable sobre calibración proviene de la comparación dentro de GEO, no de este único split."
+calibration_plot(list("Clinico+Score" = tr("cox_full")), tr("test_dat"), tr("params"),
+                 horizon = utils::tail(.valid_horizons(tr("test_dat")$time, tr("params")), 1))
+```
+
+### Contrastes formales entre modelos anidados (test interno)
+
+```{r contr-int}
+ca <- tr("contr_int_auc"); cbr <- tr("contr_int_brier")
+if (!is.null(ca))  kb(ca,  caption = "Δ AUC (clínico+score − clínico), IC95% y p")
+if (!is.null(cbr)) kb(cbr, caption = "Δ Brier (clínico+score − clínico); Δ<0 favorece al score")
+```
+
+> **Conclusión formal (interno):** todos los IC de Δ AUC y Δ Brier cruzan el cero y todos los
+> p > 0.05 — el score **no añade discriminación ni precisión de forma detectable** en el test
+> interno. Con 153 muestras y 65 eventos, este contraste tiene poca potencia.
+
+## Score data-driven (elastic-net) frente al score simple
+
+```{r elastic}
+ep <- tr("elastic_perf")
+if (!is.null(ep)) {
+  kb(data.frame(
+    Metrica = c("Genes seleccionados", "lambda.min", "C train aparente",
+                "C train 'corregido'", "C test interno", "C GEO congelado",
+                "Genes disponibles en GEO"),
+    Valor = c(ep$n_genes, signif(ep$lambda_min, 4), round(ep$c_apparent, 4),
+              round(ep$c_corrected, 4), round(ep$c_test[["C"]], 4),
+              round(ep$c_geo[["C"]], 4),
+              paste0(ep$geo_genes_used, "/", ep$geo_genes_total))),
+    caption = "Elastic-net Cox (ajustado solo en training)")
+}
+```
+
+> **El modelo sofisticado NO supera al score simple.** El elastic-net parece excelente en
+> training (C≈0.77) pero **colapsa en el test interno (C≈0.56, IC incluye 0.5)**, por debajo
+> del modelo clínico (0.63) y de clínico+score (0.67). La brecha aparente→test (~0.21) es
+> sobreajuste de manual.
+>
+> **Aviso metodológico:** el "C corregido" del elastic-net es engañoso — `rms::validate`
+> re-ajusta el Cox sobre un predictor **ya seleccionado**, sin repetir la selección de genes
+> dentro de cada bootstrap, así que no captura el optimismo de la selección. Una corrección
+> honesta exigiría envolver toda la selección en el bootstrap.
+
+## Análisis de sensibilidad
+
+```{r sens}
+st <- tr("strat_tab")
+if (!is.null(st)) {
+  kb(st$coef, caption = "Cox ESTRATIFICADO por estadio (HR del score)")
+  kb(st$ph,   caption = "Schoenfeld bajo estratificación")
+}
+rmst <- tr("rmst_tab")
+if (!is.null(rmst)) kb(cbind(grupo = rownames(rmst), rmst),
+  caption = "RMST por grupo alto/bajo de score (robusto a no proporcionalidad)")
+mice_tab <- tr("mice_tab")
+if (!is.null(mice_tab)) kb(mice_tab,
+  caption = "Cox completo con imputación múltiple (mice) — sensibilidad a faltantes")
+```
+
+> **Sin divergencias que indiquen fragilidad.** El HR del score es estable al estratificar por
+> estadio (≈1.34 vs 1.35) y con imputación múltiple (≈1.33 vs 1.35), y el global de Schoenfeld
+> deja de ser limítrofe al estratificar. Los C-index del modelo estratificado (~0.53–0.59) **no**
+> son comparables con los de la validación interna: el predictor lineal estratificado excluye el
+> efecto del estadio y mide solo discriminación dentro de cada estrato.
+
+## Validación externa (GEO)
+
+```{r external}
+ed <- tr("ext_disc")
+if (!is.null(ed)) {
+  disc <- rbind(
+    `Score solo (C)`      = ed$score_C,
+    `Modelo congelado (C)` = ed$model_C
+  )
+  kb(disc, caption = "Discriminación en GEO (C-index): score solo y modelo TCGA congelado")
+}
+ea <- tr("ext_assoc")
+if (!is.null(ea)) {
+  kb(ea$table, caption = sprintf(
+    "Re-ajuste DENTRO de GEO (n=%d, eventos=%d; ajustado por: %s): ¿replica la asociación independiente?",
+    ea$n, ea$events, paste(ea$adjusted_for, collapse = ", ")))
+}
+ec <- tr("ext_cal")
+if (!is.null(ec) && !is.null(ec$Brier)) kb(as.data.frame(ec$Brier$score),
+  caption = "Brier / IPA del modelo congelado en GEO (calibración/precisión transportada)")
+```
+
+### Contrastes formales dentro de GEO
+
+```{r contr-ext}
+ca2 <- tr("contr_ext_auc"); cb2 <- tr("contr_ext_brier")
+if (!is.null(ca2)) kb(ca2, caption = "Δ AUC (clínico+score − clínico) en GEO")
+if (!is.null(cb2)) kb(cb2, caption = "Δ Brier en GEO; Δ>0 significa que el score EMPEORA la precisión")
+```
+
+> **Conclusión formal (externo):** al transportar el modelo **congelado**, el score
+> **empeora la precisión de forma estadísticamente significativa** (Δ Brier > 0, p < 0.05 en
+> los tres horizontes), mientras que la discriminación no cambia de forma detectable.
+
+### Experimento: ¿la descalibración externa es por la ESCALA del score?
+
+Se aplica el mismo modelo congelado a GEO en dos versiones que difieren *solo* en cómo se
+estandariza `prolif_score` (edad, sexo y estadio idénticos): **(a)** z-score con media/DE del
+training de TCGA, **(b)** z-score con media/DE de la propia cohorte GEO.
+
+```{r descalib}
+ea_a <- tr("ext_cal"); ea_b <- tr("ext_cal_rescaled")
+if (!is.null(ea_a) && !is.null(ea_b)) {
+  pick <- function(d, m, lab) { z <- as.data.frame(d$Brier$score)
+    z <- z[as.character(z$model) == m, c("times", "IPA", "Brier")]
+    names(z)[2:3] <- paste0(names(z)[2:3], "_", lab); z }
+  cmp <- Reduce(function(x, y) merge(x, y, by = "times"),
+    list(pick(ea_a, "Clinico", "clinico"),
+         pick(ea_a, "Clinico+Score", "a_TCGA"),
+         pick(ea_b, "Clinico+Score", "b_GEO")))
+  kb(cmp, caption = "IPA/Brier en GEO: clínico vs score con escala TCGA (a) vs escala GEO (b)")
+}
+```
+
+```{r}
+#| label: fig-recalib
+#| fig-width: 6.8
+#| fig-height: 4.6
+#| fig-cap: "Recalibración del transporte a GEO. IPA (mayor es mejor) del modelo clínico frente al clínico+score con la escala del score congelada de TCGA y con la escala re-estimada dentro de GEO. Con la escala congelada el score queda por DEBAJO del modelo clínico en los tres horizontes; al re-estandarizarlo en la cohorte destino pasa por ENCIMA. Es la figura que resume el hallazgo principal sobre transportabilidad: la señal es real, pero la estandarización no viaja."
+print(plot_geo_recalib(tr("ext_cal"), tr("ext_cal_rescaled")))
+```
+
+Re-estandarizar el score dentro de GEO restaura la calibración y la lleva **por encima** del
+modelo clínico (IPA 0.10/0.21/0.17 frente a 0.08/0.17/0.14 del clínico), partiendo de
+0.02/0.04/0.02 con la escala de TCGA.
+
+**Qué recalibra exactamente.** La lectura **no** es "escala del score *en lugar de* hazard
+basal": el re-escalado recalibra **dos cosas a la vez**. Con $z_T=(r-\mu_T)/\sigma_T$ y
+$z_G=(r-\mu_G)/\sigma_G$:
+
+$$\beta z_T \;=\; \underbrace{\beta\frac{\sigma_G}{\sigma_T}}_{\text{pendiente}} z_G \;+\; \underbrace{\beta\frac{\mu_G-\mu_T}{\sigma_T}}_{\text{constante para todos los sujetos}}$$
+
+El componente de **media** desplaza el predictor lineal de *todos* los sujetos en una constante
+— eso es **calibración-en-lo-grande**, es decir recalibración del **basal/intercepto**. El de
+**DE** ajusta la **pendiente** del término del score.
+
+```{r decomp}
+rd <- tr("rescale_decomp")
+if (!is.null(rd)) {
+  kb(data.frame(
+    Componente = c("Media del score en GEO (escala TCGA)", "→ desplazamiento constante del lp",
+                   "→ factor multiplicativo del riesgo", "DE del score en GEO (escala TCGA)",
+                   "→ pendiente efectiva", "β original (por DE de TCGA)"),
+    Valor = round(c(rd$z_mean_geo, rd$offset_lp, rd$hr_factor,
+                    rd$z_sd_geo, rd$beta_effective, rd$beta), 3),
+    `Debería ser` = c("~0", "0", "1", "~1", "= β", "—"), check.names = FALSE),
+    caption = "Descomposición del re-escalado: componente de media (basal) y de DE (pendiente)")
+}
+```
+
+> **Conclusión corregida.** La descalibración externa es un problema de **recalibración con
+> ambos ingredientes**, y el dominante es el del **basal**: en escala TCGA el score de GEO tiene
+> media z ≈ −3.2 (en vez de ~0), lo que desplaza el predictor lineal de todos los sujetos y
+> multiplica el riesgo predicho por ≈0.39 (infra-estimación sistemática de ~61%). A la vez la DE
+> (≈1.22 en vez de ~1) infla la pendiente efectiva un ~22%. Re-estandarizar el score en la
+> cohorte destino corrige **los dos simultáneamente**.
+>
+> **Implicación práctica (intacta):** el score es transportable **en rango** —el orden de riesgo
+> se conserva, por eso la discriminación aguanta— pero **su estandarización debe re-estimarse en
+> cada cohorte**; no debe usarse congelado el z-score de TCGA.
+
+> **Lectura crítica.** La discriminación es invariante a re-escalados monótonos del score (por
+> eso se transfiere), pero la **calibración** no lo es. Además, la comparación *interno →
+> externo* del IPA **no es una inferencia válida**: el IPA interno a 5 años es negativo por
+> inestabilidad de muestra pequeña (153 muestras, 65 eventos, muy pocos en riesgo a ese
+> horizonte), no porque el modelo mejore al salir a GEO. La señal fiable sobre calibración es
+> la comparación **dentro** de GEO, entre modelos anidados sobre los mismos sujetos.
+
+# Discusión — amenazas a la validez
+
+- **Potencia: el estudio mide asociación, no incremento de discriminación.** Con
+  504 muestras y 182 eventos (153/65 en el test interno), el diseño está
+  potenciado para detectar la **asociación** del score con la supervivencia
+  (HR 1.35, p=0.003), pero **no** para estimar con precisión el **incremento de
+  discriminación**: ΔC ≈ 0.01–0.03 con intervalos que se solapan y contrastes de
+  Δ AUC / Δ Brier no significativos. Cuantificar ese incremento con utilidad
+  clínica exigiría **muchos más eventos o el agrupamiento de varias cohortes**;
+  con estos datos, afirmar una mejora de discriminación sería sobre-interpretar.
+- **Ajuste por estadio (confusión dominante).** El estadio explica gran parte
+  del pronóstico en LUAD; sin ajustarlo, cualquier firma proliferativa tiende a
+  ser su proxy. Todo el reporte se lee *tras* ajuste.
+- **El score data-driven no mejora al simple.** El elastic-net (26 genes) sobreajusta
+  gravemente (C 0.77 en training → 0.56 en test) y queda por debajo del modelo
+  clínico. La complejidad adicional no se traduce en desempeño.
+- **Sesgo de espectro.** TCGA es una cohorte mayormente quirúrgica; la
+  generalización a estadios avanzados o a población tratada es limitada.
+- **Confusión residual.** Tabaquismo, tratamiento adyuvante y comorbilidad están
+  mal capturados o ausentes; parte del "efecto" del score podría reflejarlos.
+- **Ancestría.** TCGA está sesgada a ascendencia europea; la transportabilidad a
+  otras poblaciones (p. ej. GSE31210, japonesa) no está garantizada.
+- **Batch / plataforma.** Efecto de lote (TSS/placa) en TCGA y cambio de
+  plataforma (RNA-seq → microarray) en GEO; se documenta y se prefiere un score
+  rank-based en vez de sobre-corregir.
+- **Multiplicidad y overfitting.** El elastic-net y la exploración por firmas
+  invitan al sobreajuste; se mitiga con selección solo-en-training, corrección
+  por optimismo y un test retenido.
+- **Faltantes.** Análisis primario por caso completo con sensibilidad `mice`;
+  divergencias entre ambos se interpretan como fragilidad.
+- **Fiabilidad del endpoint.** Se usa TCGA-CDR (OS/PFI curados); aun así, la
+  duración y calidad del seguimiento condicionan las estimaciones a largo plazo.
+
+# Conclusiones (medidas)
+
+Todas las afirmaciones se derivan de las tablas y figuras anteriores.
+
+- **La asociación es real y replicable.** El score de proliferación se asocia de forma
+  independiente a la supervivencia tras ajustar por estadio, edad y sexo (HR 1.35 en TCGA,
+  @fig-forest; HR 1.24 re-ajustado en GEO, p<0.005 en ambas), y sobrevive a la estratificación
+  por estadio y a la imputación múltiple.
+- **Pero el aporte incremental no es clínicamente demostrable con estos datos.** El incremento
+  de C-index (~0.02–0.03) queda dentro del margen de su IC, y los contrastes formales de
+  ΔAUC/ΔBrier en el test retenido no son significativos (@fig-auc-t). Nótese que el ΔAUC, que es
+  invariante a la calibración, ya es no significativo por sí solo, de modo que esta conclusión
+  no depende de los problemas de calibración del test. La significación del coeficiente no
+  equivale a mejora de discriminación.
+- **La validación interna se apoya en un único split modestamente desafortunado.** El brazo de
+  test resultó con mayor tasa de eventos (42.5% vs 33.3%), lo que descalibra el modelo en ese
+  brazo (@fig-calib). Por eso la evidencia de replicación que consideramos fiable es la
+  comparación dentro de GEO, no este split; una validación cruzada repetida sería la extensión
+  natural.
+- **La complejidad no ayuda.** El elastic-net sobreajusta (C 0.77→0.56) y no supera al score
+  simple ni al modelo clínico; el "C corregido" que no envuelve la selección en el bootstrap
+  sobreestima su desempeño.
+- **El transporte entre plataformas exige recalibración.** Congelado, el score degrada la
+  calibración de forma significativa; el problema es de escala/basal (media z −3.18 en GEO) y se
+  corrige re-estandarizando en la cohorte destino, no descartando el marcador (@fig-recalib).
+- **Lectura general.** Un resultado pequeño pero replicable es científicamente valioso; uno
+  grande pero no replicable es una señal de alarma, no un hallazgo. El aporte de este marcador
+  debe juzgarse por el IC del incremento y la replicación, no por la significación aislada en un
+  único ajuste.
+
+# Disponibilidad de código y datos
+
+- **Código.** Todo el análisis está orquestado con `targets` (`_targets.R`) y es
+  reproducible con `renv::restore()` + `targets::tar_make()`.
+- **Datos.** TCGA-LUAD y TCGA-CDR son open-access (sin token); la cohorte GEO es
+  pública. Los datos crudos (`data/raw/`) están en `.gitignore` por tamaño; el
+  pipeline los descarga de forma idempotente.
+
+# Reproducibilidad — sessionInfo
+
+```{r sessioninfo}
+sessioninfo::session_info()
+```

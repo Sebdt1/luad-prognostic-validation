@@ -1,0 +1,110 @@
+# =============================================================================
+# params.yml — Configuración central y única fuente de verdad del pipeline
+# -----------------------------------------------------------------------------
+# Todo parámetro que afecte un resultado vive aquí (no incrustado en el código),
+# para que el pipeline sea auditable y reproducible. La semilla global se fija
+# desde aquí y se reporta en sessionInfo(). Cambiar 'run.smoke_test' a false
+# ejecuta la corrida completa; en true se submuestrea para iterar rápido.
+# =============================================================================
+
+project:
+  name: luad-prognostic-validation
+  # Semilla global. Se aplica en R/00_utils.R::set_global_seed() y se reporta.
+  seed: 1234
+
+run:
+  # smoke_test = true  -> submuestra las cohortes para validar el DAG en minutos.
+  # smoke_test = false -> corrida completa (descargas grandes, horas la 1a vez).
+  smoke_test: false
+  # Nº de muestras por brazo (train/test) que se conservan en modo smoke.
+  smoke_n: 80
+  cache_dir: data/raw
+  processed_dir: data/processed
+
+split:
+  # La partición se hace ANTES de cualquier análisis. Toda selección de
+  # features/score se realiza SOLO en training para evitar fuga de información.
+  p_train: 0.70
+  # Estratificamos por estadio agrupado para equilibrar el pronóstico basal
+  # entre brazos (el estadio es el confusor pronóstico dominante en LUAD).
+  stratify_by: stage_group
+
+acquisition:
+  tcga_project: TCGA-LUAD
+  gdc_workflow: "STAR - Counts"
+  # TP = Primary Tumor. Excluimos normales y metástasis para una cohorte
+  # pronóstica homogénea (documentado como sesgo de espectro: cohorte quirúrgica).
+  sample_type_codes: ["01"]
+  cdr:
+    # Recurso clínico curado TCGA-CDR (Liu et al., Cell 2018). Usamos OS/PFI
+    # curados, NO days_to_death crudo (menos fiable). El UUID es de la página
+    # PanCanAtlas del GDC; VERIFICAR en:
+    #   https://gdc.cancer.gov/about-data/publications/pancanatlas
+    # Si la descarga automática falla, descargar manualmente el archivo
+    # 'TCGA-CDR-SupplementalTableS1.xlsx' a data/raw/ y el pipeline lo usará.
+    url: "https://api.gdc.cancer.gov/data/1b5f413e-a8d1-4d10-92eb-7c4ae739ed81"
+    file: TCGA-CDR-SupplementalTableS1.xlsx
+    sheet: "TCGA-CDR"
+  # Endpoint pronóstico primario. OS = supervivencia global; PFI = intervalo
+  # libre de progresión (recomendado por TCGA-CDR para LUAD junto con OS).
+  endpoint: OS
+  geo:
+    # Cohorte de validación externa independiente (adyuvante/quirúrgica).
+    # GSE68465 (Director's Challenge, Affymetrix U133A) trae supervivencia.
+    # Alternativa: GSE31210 (estadio I-II, japonesa).
+    gse_id: GSE68465
+    platform: GPL96
+
+qc:
+  # Filtro de genes de baja expresión (estilo edgeR::filterByExpr, criterio
+  # explícito y auditable): conservar genes con >= min_count en >= min_prop
+  # de las muestras del TRAINING (el umbral se aprende solo en training).
+  min_count: 10
+  min_prop_samples: 0.20
+  # Transformación de la varianza para análisis downstream y visualización.
+  # vst (DESeq2) recomendado; logcpm (edgeR) como alternativa.
+  transform: vst
+  # Detección de muestras atípicas por tamaño de librería (nº de MADs).
+  library_size_mad: 4
+  # Variables candidatas a efecto de lote a inspeccionar por PCA (documentar,
+  # NO sobre-corregir): centro de tejido (TSS) y placa.
+  batch_vars: ["tss", "plate"]
+
+score:
+  # (a) Score primario de proliferación con singscore (rank-based, transferible
+  #     entre plataformas sin re-entrenamiento) sobre firmas Hallmark.
+  method: singscore
+  gene_sets:
+    - HALLMARK_G2M_CHECKPOINT
+    - HALLMARK_E2F_TARGETS
+  msigdb_species: "Homo sapiens"
+  msigdb_collection: H
+  # Escalado para transferencia entre plataformas: z-score respecto a la
+  # distribución del TRAINING (los parámetros de escala se guardan y se aplican
+  # tal cual a test y a GEO -> sin fuga).
+  scaling: zscore
+  # (b) Score secundario: Cox elastic-net (glmnet), lambda por CV.
+  elasticnet:
+    alpha: 0.5
+    nfolds: 10
+    # nº mínimo de eventos para intentar el elastic-net (si no, se omite).
+    min_events: 40
+
+model:
+  # Modelo clínico estándar. SIEMPRE se ajusta por estadio: una "firma" sin
+  # ajuste por estadio suele ser un mero proxy del estadio.
+  clinical_vars: ["age_std", "gender", "stage_group"]
+  time_var: time
+  event_var: status
+
+validation:
+  # C-index corregido por optimismo vía bootstrap.
+  bootstrap_B: 200
+  # Horizontes (días) para AUC tiempo-dependiente (timeROC) y Brier/IPA: 1,3,5 años.
+  horizons_days: [365, 1095, 1825]
+  # Intervalo de confianza para todas las métricas reportadas.
+  ci_level: 0.95
+
+report:
+  # Umbral de p para señalar (no para dicotomizar decisiones): solo descriptivo.
+  alpha: 0.05
