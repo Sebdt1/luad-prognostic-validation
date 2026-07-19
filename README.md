@@ -38,6 +38,32 @@ GSE68465 (n=442, 236 muertes). El pipeline corre sin error de principio a fin, l
 22 tests de `tests/test_utils.R` pasan y `renv.lock` está sincronizado. Entorno
 verificado: R 4.6.1, Bioconductor 3.23, Quarto 1.9.38.
 
+### Aviso: `renv::restore()` no completa a la primera
+
+Probé el ciclo clonar → `renv::restore()` en un clon limpio y **no funciona de una
+sola pasada**. De los 274 paquetes del lockfile, 272 se instalan y fallan siempre
+dos, `diffobj` y `lme4`. renv no reporta ninguna causa: los descarga bien y falla en
+el paso de instalación sin mensaje. Instalados por separado con `renv::install()`
+entran sin problema, y en las mismas versiones que fija el lockfile, así que no es
+un problema de versiones retiradas de CRAN.
+
+Importa porque `renv::restore()` es **transaccional**: al fallar esos dos revierte
+los otros 272 y la librería queda inservible pese al mensaje "Successfully installed
+272 packages". Si lo ves, no te fíes del mensaje; comprueba con
+`requireNamespace("targets")`.
+
+El rodeo, hasta que lo resuelva:
+
+```r
+renv::restore(prompt = FALSE)          # fallará en diffobj y lme4
+renv::install(c("diffobj", "lme4"))    # estos sí entran
+renv::restore(prompt = FALSE)          # completa el resto
+```
+
+No he conseguido reproducir el entorno de forma limpia en un solo comando, y
+prefiero decirlo a que te lo encuentres tú. La causa sigue abierta; sospecho de la
+instalación en paralelo de renv en Windows, pero no lo he demostrado.
+
 ### Cosas que costaron y conviene saber
 
 La descarga de RNA-seq de TCGAbiolinks 2.40.0 está rota por sus dos vías. Con
